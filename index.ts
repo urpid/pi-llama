@@ -138,11 +138,13 @@ function applyTemplateThinkingSupport(model: MutableModelMetadata): void {
 	model.compat = {
 		...model.compat,
 		// Despite the Pi enum name, this sends llama.cpp's generic
-		// chat_template_kwargs.enable_thinking payload, not a Qwen-only option.
-		thinkingFormat: "qwen-chat-template",
+		// chat_template_kwargs payload; "chat-template" is the format whose
+		// resolver actually reads compat.chatTemplateKwargs per request.
+		thinkingFormat: "chat-template",
 		chatTemplateKwargs: {
 			...(model.compat && "chatTemplateKwargs" in model.compat ? model.compat.chatTemplateKwargs as Record<string, unknown> : {}),
 			enable_thinking: { $var: "thinking.enabled" },
+			preserve_thinking: true,
 			reasoning_effort: { $var: "thinking.effort" },
 		},
 	};
