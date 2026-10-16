@@ -16,10 +16,9 @@ const PROVIDER_ID = "llama-cpp";
 const DEFAULT_BASE_URL = "http://localhost:8080/v1";
 // Fallback for /v1/models entries missing meta.n_ctx.
 const DEFAULT_CONTEXT_WINDOW = 8192;
-// llama.cpp has no output-token cap (no endpoint reports one; generation is only
-// bounded by the context window), so use Pi's own default for models that omit
-// maxTokens (see model-registry.ts parseModels).
-const DEFAULT_MAX_TOKENS = 16384;
+// Pi's own default for models that omit maxTokens; llama.cpp generation is only
+// bounded by the context window, and this host's servers run --n-predict 32768.
+const DEFAULT_MAX_TOKENS = 32768;
 const PROPS_TIMEOUT_MS = 120_000;
 
 const ModelsResponseSchema = Type.Object({
@@ -110,12 +109,15 @@ const MODEL_LOAD_STAGE_LABELS: Record<ApiModelLoadStage, string> = {
 type LlamaModel = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]["models"]>[number];
 type ExtensionCtx = Parameters<Parameters<ExtensionAPI["on"]>[1]>[1];
 
-// llama.cpp template thinking is boolean, so expose Pi's default off/medium toggle only.
+// When the chat template reads reasoning_effort as a variable, Pi's thinking
+// levels can be forwarded to llama.cpp instead of only the boolean off/medium toggle.
 const TEMPLATE_THINKING_LEVEL_MAP = {
 	minimal: null,
-	low: null,
-	high: null,
-	xhigh: null,
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "xhigh",
+	max: null,
 } satisfies NonNullable<LlamaModel["thinkingLevelMap"]>;
 
 // Minimal shape needed to update both registered models and Pi's active model snapshot.
@@ -127,7 +129,9 @@ type MutableModelMetadata = {
 	maxTokens: number;
 };
 
-// Mark a model as using llama.cpp's chat_template_kwargs.enable_thinking control.
+// Mark a model as using llama.cpp's chat_template_kwargs control: enable_thinking
+// (boolean) plus reasoning_effort, resolved per request from Pi's thinking level
+// through thinkingLevelMap.
 function applyTemplateThinkingSupport(model: MutableModelMetadata): void {
 	model.reasoning = true;
 	model.thinkingLevelMap = TEMPLATE_THINKING_LEVEL_MAP;
@@ -136,6 +140,11 @@ function applyTemplateThinkingSupport(model: MutableModelMetadata): void {
 		// Despite the Pi enum name, this sends llama.cpp's generic
 		// chat_template_kwargs.enable_thinking payload, not a Qwen-only option.
 		thinkingFormat: "qwen-chat-template",
+		chatTemplateKwargs: {
+			...(model.compat && "chatTemplateKwargs" in model.compat ? model.compat.chatTemplateKwargs as Record<string, unknown> : {}),
+			enable_thinking: { $var: "thinking.enabled" },
+			reasoning_effort: { $var: "thinking.effort" },
+		},
 	};
 }
 
