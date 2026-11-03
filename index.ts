@@ -7,13 +7,16 @@
  * Usage: `pi install github.com/huggingface/pi-llama`
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { compact, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
 import { Loader, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 const PROVIDER_ID = "llama-cpp";
-const DEFAULT_BASE_URL = "http://localhost:8080/v1";
+// Thinking level used for compaction (summarization) when the active model is
+// one of this extension's llama-cpp models, independent of the session level.
+const COMPACTION_THINKING_LEVEL = "low" as const;
+const DEFAULT_BASE_URL = "http://localhost:8081/v1";
 // Fallback for /v1/models entries missing meta.n_ctx.
 const DEFAULT_CONTEXT_WINDOW = 8192;
 // Pi's own default for models that omit maxTokens; llama.cpp generation is only
@@ -171,6 +174,36 @@ function notify(
 	} catch (error) {
 		if (!isStaleContextError(error)) {
 			console.warn(message);
+		}
+	}
+}
+
+// Hook-provided compactions are marked fromHook, and Pi's native preparation
+// only carries file lists from previous compactions it generated itself. Since
+// this extension returns Pi's own details shape, re-seed the previous
+// compaction entry's file lists so cumulative tracking survives repeated
+// extension compactions.
+function restorePreviousFileOperations(
+	preparation: { fileOps: { read: Set<string>; edited: Set<string> } },
+	branchEntries: Array<{ type: string; details?: unknown }>,
+): void {
+	const previous = [...branchEntries].reverse().find((entry) => entry.type === "compaction");
+	if (!previous || typeof previous.details !== "object" || previous.details === null) {
+		return;
+	}
+	const details = previous.details as { readFiles?: unknown; modifiedFiles?: unknown };
+	if (Array.isArray(details.readFiles)) {
+		for (const path of details.readFiles) {
+			if (typeof path === "string") {
+				preparation.fileOps.read.add(path);
+			}
+		}
+	}
+	if (Array.isArray(details.modifiedFiles)) {
+		for (const path of details.modifiedFiles) {
+			if (typeof path === "string") {
+				preparation.fileOps.edited.add(path);
+			}
 		}
 	}
 }
@@ -631,6 +664,53 @@ export default async function (pi: ExtensionAPI) {
 			// Session was replaced as the request fired; nothing to discover.
 			if (!isStaleContextError(error)) {
 				throw error;
+			}
+		}
+	});
+
+	// Compaction for llama-cpp models runs with a fixed thinking level instead
+	// of the session's current level: local summarization should stay cheap and
+	// fast. Falls back to Pi's native compaction when anything fails.
+	pi.on("session_before_compact", async (event, ctx) => {
+		if (event.signal.aborted) {
+			return;
+		}
+		const model = ctx.model;
+		if (!model || model.provider !== PROVIDER_ID) {
+			return;
+		}
+		try {
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+			if (!auth.ok) {
+				console.warn(`[llama-cpp] compaction auth failed: ${auth.error}; using Pi's active model.`);
+				return;
+			}
+			// Mirror Pi's native auth handling: honor a request-time baseUrl and
+			// drop headers resolved as null (header deletion markers).
+			const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+			const headers = auth.headers
+				? Object.fromEntries(
+						Object.entries(auth.headers).filter(
+							(entry): entry is [string, string] => entry[1] !== null,
+						),
+					)
+				: undefined;
+			restorePreviousFileOperations(event.preparation, event.branchEntries);
+			const result = await compact(
+				event.preparation,
+				requestModel,
+				auth.apiKey,
+				headers,
+				event.customInstructions,
+				event.signal,
+				COMPACTION_THINKING_LEVEL,
+				undefined,
+				auth.env,
+			);
+			return { compaction: result };
+		} catch (error) {
+			if (!event.signal.aborted) {
+				console.warn(`[llama-cpp] compaction failed; using Pi's active model.`, error);
 			}
 		}
 	});
