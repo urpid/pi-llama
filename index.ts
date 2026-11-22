@@ -8,7 +8,7 @@
  */
 
 import { compact, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { Compile } from "typebox/compile";
 import { Loader, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -77,6 +77,13 @@ const PropsResponseSchema = Type.Object({
 		}),
 	),
 	chat_template: Type.Optional(Type.String()),
+	chat_template_caps: Type.Optional(
+		Type.Object({
+			supports_reasoning_effort: Type.Optional(Type.Boolean()),
+			reasoning_effort_levels: Type.Optional(Type.Array(Type.String())),
+			reasoning_effort_rejected: Type.Optional(Type.Array(Type.String())),
+		}),
+	),
 	build_info: Type.Optional(Type.String()),
 });
 
@@ -109,7 +116,10 @@ const MODEL_LOAD_STAGE_LABELS: Record<ApiModelLoadStage, string> = {
 	mmproj_model: "Loading projector",
 };
 
-type LlamaModel = NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]["models"]>[number];
+type LlamaModel = Extract<
+	NonNullable<Parameters<ExtensionAPI["registerProvider"]>[1]["models"]>[number],
+	{ reasoning: boolean }
+> & { status?: NonNullable<Static<typeof ModelsResponseSchema>["data"]>[number]["status"] };
 type ExtensionCtx = Parameters<Parameters<ExtensionAPI["on"]>[1]>[1];
 
 // When the chat template reads reasoning_effort as a variable, Pi's thinking
@@ -132,25 +142,56 @@ type MutableModelMetadata = {
 	maxTokens: number;
 };
 
-// Mark a model as using llama.cpp's chat_template_kwargs control: enable_thinking
-// (boolean) plus reasoning_effort, resolved per request from Pi's thinking level
-// through thinkingLevelMap.
-function applyTemplateThinkingSupport(model: MutableModelMetadata): void {
+function applyTemplateThinkingSupport(
+	model: MutableModelMetadata,
+	props: Static<typeof PropsResponseSchema>,
+): boolean {
+	const template = props.chat_template ?? "";
+	const toggle = template.includes("enable_thinking");
+	const caps = props.chat_template_caps;
+	const advertised = caps?.reasoning_effort_levels;
+	const rejected = new Set(caps?.reasoning_effort_rejected);
+	const thinkingLevelMap: NonNullable<LlamaModel["thinkingLevelMap"]> = {};
+	const levels = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+	for (const level of levels) {
+		// Use the negotiated levels when present; keep the old mapping for older
+		// servers whose templates expose both controls but report no level list.
+		const supported = caps?.supports_reasoning_effort !== false && !rejected.has(level) &&
+			(advertised?.includes(level) ??
+				(toggle && template.includes("reasoning_effort") && TEMPLATE_THINKING_LEVEL_MAP[level] !== null));
+		thinkingLevelMap[level] = supported ? level : null;
+	}
+	const effort = levels.some((level) => thinkingLevelMap[level] !== null);
+	if (!toggle && !effort) {
+		const changed = model.reasoning;
+		model.reasoning = false;
+		model.thinkingLevelMap = undefined;
+		return changed;
+	}
+	if (!effort) {
+		// Pi calls the single enabled choice "medium"; the server gets only a boolean.
+		thinkingLevelMap.medium = "medium";
+	} else if (!toggle) {
+		// llama.cpp does not probe "none" in its list of positive levels.
+		const supportsNone = !rejected.has("none") &&
+			(advertised?.includes("none") || /["']none["']\s*:\s*0(?:\.0+)?\s*[,}]/.test(template));
+		thinkingLevelMap.off = supportsNone ? "none" : null;
+	}
+	const chatTemplateKwargs = {
+		...(model.compat && "chatTemplateKwargs" in model.compat ? model.compat.chatTemplateKwargs : {}),
+		...(toggle ? { enable_thinking: { $var: "thinking.enabled" as const }, preserve_thinking: true } : {}),
+		...(effort ? { reasoning_effort: { $var: "thinking.effort" as const } } : {}),
+	};
+	if (!toggle) delete chatTemplateKwargs.enable_thinking;
+	if (!effort) delete chatTemplateKwargs.reasoning_effort;
 	model.reasoning = true;
-	model.thinkingLevelMap = TEMPLATE_THINKING_LEVEL_MAP;
+	model.thinkingLevelMap = thinkingLevelMap;
 	model.compat = {
 		...model.compat,
-		// Despite the Pi enum name, this sends llama.cpp's generic
-		// chat_template_kwargs payload; "chat-template" is the format whose
-		// resolver actually reads compat.chatTemplateKwargs per request.
 		thinkingFormat: "chat-template",
-		chatTemplateKwargs: {
-			...(model.compat && "chatTemplateKwargs" in model.compat ? model.compat.chatTemplateKwargs as Record<string, unknown> : {}),
-			enable_thinking: { $var: "thinking.enabled" },
-			preserve_thinking: true,
-			reasoning_effort: { $var: "thinking.effort" },
-		},
+		chatTemplateKwargs,
 	};
+	return true;
 }
 
 // Pi invalidates a captured ctx when the session is replaced (e.g. new_session in
@@ -332,7 +373,7 @@ export default async function (pi: ExtensionAPI) {
 	}
 
 	const discoveredMetadata = new Set<string>();
-	const pendingMetadata = new Set<string>();
+	const pendingMetadata = new Map<string, AbortController>();
 	let currentlyLoadedModel: string | null = null;
 	let statusTimeout: ReturnType<typeof setTimeout> | undefined;
 	let sseAbortController: AbortController | null = null;
@@ -470,7 +511,9 @@ export default async function (pi: ExtensionAPI) {
 			}
 			notify(ctx, `[llama-cpp] SSE error: ${msg}`, "warning");
 		} finally {
-			sseAbortController = null;
+			if (sseAbortController?.signal === signal) {
+				sseAbortController = null;
+			}
 		}
 	}
 
@@ -481,7 +524,7 @@ export default async function (pi: ExtensionAPI) {
 		timeoutMs = PROPS_TIMEOUT_MS,
 		selectedModel?: MutableModelMetadata,
 	): Promise<void> {
-		const model = currentModels.find((m) => m.id === modelId);
+		let model = currentModels.find((m) => m.id === modelId);
 		if (!model) {
 			return;
 		}
@@ -498,28 +541,28 @@ export default async function (pi: ExtensionAPI) {
 				if (selectedModel) {
 					selectedModel.contextWindow = model.contextWindow;
 					selectedModel.maxTokens = model.maxTokens;
-					if (model.reasoning) {
-						selectedModel.reasoning = model.reasoning;
-						selectedModel.thinkingLevelMap = model.thinkingLevelMap;
-						selectedModel.compat = model.compat;
-					}
+					selectedModel.reasoning = model.reasoning;
+					selectedModel.thinkingLevelMap = model.thinkingLevelMap;
+					selectedModel.compat = model.compat;
 				}
 				return;
 			}
 		}
-		if (pendingMetadata.has(modelId)) {
+		const pending = pendingMetadata.get(modelId);
+		if (pending && !pending.signal.aborted) {
 			return;
 		}
 
-		pendingMetadata.add(modelId);
 		// Cancel any pending clear timeout from a previous model load.
 		clearFooterStatusTimeout();
 		// Abort any in-flight /props request from a previous model.
 		if (propsAbortController) {
 			propsAbortController.abort();
 		}
-		propsAbortController = new AbortController();
-		const timer = setTimeout(() => propsAbortController.abort(), timeoutMs);
+		const controller = new AbortController();
+		propsAbortController = controller;
+		pendingMetadata.set(modelId, controller);
+		const timer = setTimeout(() => controller.abort(), timeoutMs);
 		const shouldAutoload = autoload && !isLoaded;
 		const propsUrl = `${baseUrl.replace(/\/v1$/, "")}/props?model=${encodeURIComponent(modelId)}&autoload=${shouldAutoload}`;
 		const clearFooterStatusLater = () => {
@@ -554,7 +597,10 @@ export default async function (pi: ExtensionAPI) {
 				void connectToLoadingProgress(modelId, ctx, loader);
 			}
 
-			const response = await fetch(propsUrl, { signal: propsAbortController.signal });
+			const response = await fetch(propsUrl, { signal: controller.signal });
+			if (controller.signal.aborted) {
+				return;
+			}
 			if (!response.ok) {
 				// 500 during autoload is expected when the server cancels a load to start
 				// another model. Suppress the notification for that case.
@@ -564,11 +610,19 @@ export default async function (pi: ExtensionAPI) {
 				return;
 			}
 			const data: unknown = await response.json();
+			if (controller.signal.aborted) {
+				return;
+			}
 			if (!validatePropsResponse.Check(data)) {
 				const errors = [...validatePropsResponse.Errors(data)]
 					.map((e) => `${"path" in e ? e.path : ""} ${e.message}`)
 					.join("; ");
 				ctx?.ui.notify(`[llama-cpp] invalid /props response for ${modelId}: ${errors}`, "error");
+				return;
+			}
+			// /model may have refreshed the registry while the request was in flight.
+			model = currentModels.find((m) => m.id === modelId);
+			if (!model) {
 				return;
 			}
 			const nCtx = data.default_generation_settings?.n_ctx;
@@ -584,21 +638,15 @@ export default async function (pi: ExtensionAPI) {
 				selectedModel.contextWindow = model.contextWindow;
 				selectedModel.maxTokens = model.maxTokens;
 			}
-			if (data.chat_template?.includes("enable_thinking") === true) {
-				applyTemplateThinkingSupport(model);
-				if (selectedModel) {
-					applyTemplateThinkingSupport(selectedModel);
-					if (pi.getThinkingLevel() === "off") {
-						pi.setThinkingLevel("medium");
-					}
-				}
-				updated = true;
+			updated = applyTemplateThinkingSupport(model, data) || updated;
+			if (selectedModel && selectedModel !== model) {
+				applyTemplateThinkingSupport(selectedModel, data);
 			}
 			discoveredMetadata.add(modelId);
 			if (shouldAutoload) {
 				currentlyLoadedModel = modelId;
 			}
-			if (loadedFooterStatus && ctx && !isLoaded) {
+			if (loadedFooterStatus && ctx && shouldAutoload) {
 				const prefix = ctx.ui.theme.fg("success", "[llama.cpp] ✓");
 				ctx.ui.setWidget(PROVIDER_ID, [
 					prefix +
@@ -628,11 +676,13 @@ export default async function (pi: ExtensionAPI) {
 			}
 		} finally {
 			clearTimeout(timer);
-			pendingMetadata.delete(modelId);
-			propsAbortController = null;
-			// Stop SSE connection when done
-			if (sseAbortController) {
-				sseAbortController.abort();
+			if (pendingMetadata.get(modelId) === controller) {
+				pendingMetadata.delete(modelId);
+			}
+			if (propsAbortController === controller) {
+				propsAbortController = null;
+				// Do not end a newer model's progress stream.
+				sseAbortController?.abort();
 				sseAbortController = null;
 			}
 		}
@@ -652,6 +702,13 @@ export default async function (pi: ExtensionAPI) {
 			return;
 		}
 		void discoverModelMetadata(event.model.id, ctx, true, PROPS_TIMEOUT_MS, event.model);
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		const model = ctx.model;
+		if (model?.provider === PROVIDER_ID) {
+			await discoverModelMetadata(model.id, ctx, false, 5000, model);
+		}
 	});
 
 	// Discover /props for already-active models because re-selecting them does not emit model_select.
